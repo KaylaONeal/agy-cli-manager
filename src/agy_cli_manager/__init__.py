@@ -27,6 +27,12 @@ from agy_cli_manager.manager import (
     update_account_runtime_metadata,
     clear_account_proxy,
 )
+from agy_cli_manager.watch import (
+    clear_restart_required,
+    parse_quota_log_line,
+    poll_quota_logs,
+    watch_quota_logs,
+)
 
 __all__ = [
     "ManagerPaths",
@@ -54,4 +60,8 @@ __all__ = [
     "update_switch_policy",
     "update_account_runtime_metadata",
     "clear_account_proxy",
+    "clear_restart_required",
+    "parse_quota_log_line",
+    "poll_quota_logs",
+    "watch_quota_logs",
 ]

@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="720" viewBox="0 0 1600 720" role="img" aria-labelledby="title desc">
+  <title id="title">Quota full? Switch accounts.</title>
+  <desc id="desc">Three steps: quota full, switch account, restart agy.</desc>
+  <style>
+    .mono { font-family: "DejaVu Sans Mono", "SFMono-Regular", Consolas, monospace; }
+    .sans { font-family: "Segoe UI", "DejaVu Sans", Arial, sans-serif; }
+    .fg { fill: #f2f6fb; }
+    .muted { fill: #9aa7b5; }
+    .title { font-size: 42px; font-weight: 700; }
+    .card-title { font-size: 36px; font-weight: 700; }
+    .card-body { font-size: 22px; }
+    .footer { font-size: 22px; }
+  </style>
+
+  <rect width="1600" height="720" fill="#0b0f14"/>
+  <text x="800" y="88" text-anchor="middle" class="sans title fg">Quota full? Switch accounts.</text>
+
+  <rect x="64" y="160" width="400" height="380" rx="28" fill="#3a1418" stroke="#ff5f5f" stroke-width="3"/>
+  <text x="264" y="250" text-anchor="middle" class="sans card-title" fill="#ff8a8a">1. Quota full</text>
+  <text x="264" y="330" text-anchor="middle" class="sans card-body fg">agy hits</text>
+  <text x="264" y="368" text-anchor="middle" class="sans card-body fg">Individual quota reached</text>
+
+  <polygon points="494,350 544,330 544,370" fill="#5fd7ff"/>
+
+  <rect x="564" y="160" width="400" height="380" rx="28" fill="#102028" stroke="#5fd7ff" stroke-width="3"/>
+  <text x="764" y="250" text-anchor="middle" class="sans card-title" fill="#5fd7ff">2. Switch account</text>
+  <text x="764" y="330" text-anchor="middle" class="sans card-body fg">watch copies the next</text>
+  <text x="764" y="368" text-anchor="middle" class="sans card-body fg">login onto disk</text>
+
+  <polygon points="994,350 1044,330 1044,370" fill="#5fd75f"/>
+
+  <rect x="1064" y="160" width="472" height="380" rx="28" fill="#142414" stroke="#5fd75f" stroke-width="3"/>
+  <text x="1300" y="250" text-anchor="middle" class="sans card-title" fill="#5fd75f">3. Restart agy</text>
+  <text x="1300" y="330" text-anchor="middle" class="sans card-body fg">new chat uses</text>
+  <text x="1300" y="368" text-anchor="middle" class="sans card-body fg">the new account</text>
+
+  <text x="800" y="640" text-anchor="middle" class="mono footer muted">Run: agy-cli-manager watch</text>
+</svg>

@@ -18,7 +18,12 @@ import math
 from pathlib import Path
 from contextlib import contextmanager
 
-import fcntl
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+from agy_cli_manager.watch import get_log_watch_snapshot
 
 
 MANAGED_PROFILE_FILES = (
@@ -164,7 +169,16 @@ def ensure_layout(paths: ManagerPaths) -> None:
 def manager_lock(paths: ManagerPaths):
     ensure_layout(paths)
     with paths.lock_file.open("a+", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        if os.name == "nt":
+            # msvcrt.locking() requires an existing byte at the current
+            # position and locks a byte range rather than the whole file.
+            f.seek(0)
+            f.write("0")
+            f.flush()
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         try:
             f.seek(0)
             f.truncate()
@@ -174,9 +188,19 @@ def manager_lock(paths: ManagerPaths):
         finally:
             try:
                 f.seek(0)
-                f.truncate()
+                if os.name == "nt":
+                    # Keep the locked byte present until msvcrt releases it.
+                    f.write("0")
+                    f.truncate(1)
+                    f.flush()
+                else:
+                    f.truncate()
             finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                if os.name == "nt":
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def load_state(paths: ManagerPaths) -> dict:
@@ -2052,6 +2076,7 @@ def get_status_snapshot(paths: ManagerPaths) -> dict:
         "switch_policy": _state_switch_policy(state),
         "switch_runtime": _normalize_switch_runtime(state.get("switch_runtime")),
         "switch_history": _normalize_switch_history(state.get("switch_history")),
+        "log_watch": get_log_watch_snapshot(paths),
         "accounts": snapshot_accounts,
     }
 
@@ -2309,162 +2334,137 @@ def rotate_after_failure(
         raise ValueError("Cooldown minutes must be non-negative.")
 
     with manager_lock(paths):
-        state = sync_state_from_disk(paths, load_state(paths))
-        if live_dir is not None:
-            state["live_dir"] = str(live_dir.resolve())
-        switch_mode = get_switch_mode(state)
-        runtime = _normalize_switch_runtime(state.get("switch_runtime"))
-        now = utc_now()
-        now_iso = now.isoformat()
-
-        last_completed_at = parse_timestamp(runtime.get("last_completed_at"))
-        if (
-            runtime.get("status") == "ready"
-            and runtime.get("reason") == reason
-            and last_completed_at is not None
-            and (now - last_completed_at).total_seconds() <= dedupe_seconds
-            and state.get("active")
-        ):
-            _mark_switch_runtime(
-                state,
-                status="ready",
-                reason=reason,
-                trigger=trigger,
-                request_id=request_id,
-                active=state.get("active"),
-                previous_active=runtime.get("previous_active"),
-                started_at=runtime.get("last_started_at"),
-                completed_at=runtime.get("last_completed_at"),
-            )
-            _append_switch_history(
-                state,
-                reason=reason,
-                trigger=trigger,
-                request_id=request_id,
-                previous_active=runtime.get("previous_active"),
-                active=state.get("active"),
-                switched_to=None,
-                outcome="already_switched",
-                cooldown_minutes=0,
-                at=runtime.get("last_completed_at"),
-            )
-            save_state(paths, state)
-            return RotationResult(
-                previous_active=runtime.get("previous_active"),
-                active=state.get("active"),
-                switched_to=None,
-                marked_bad=False,
-                reason=reason,
-                cooldown_minutes=0,
-                outcome="already_switched",
-            )
-
-        previous = state.get("active")
-        _mark_switch_runtime(
-            state,
-            status="switching",
-            reason=reason,
+        return rotate_after_failure_locked(
+            paths,
+            reason,
+            cooldown_minutes=cooldown_minutes,
+            live_dir=live_dir,
+            force_switch=force_switch,
+            dedupe_seconds=dedupe_seconds,
             trigger=trigger,
             request_id=request_id,
-            active=previous,
-            previous_active=previous,
-            started_at=now_iso,
-            completed_at=None,
         )
-        save_state(paths, state)
-        if not previous:
-            _mark_switch_runtime(
-                state,
-                status="no_account",
-                reason=reason,
-                trigger=trigger,
-                request_id=request_id,
-                active=None,
-                previous_active=None,
-                completed_at=utc_now().isoformat(),
-            )
-            _append_switch_history(
-                state,
-                reason=reason,
-                trigger=trigger,
-                request_id=request_id,
-                previous_active=None,
-                active=None,
-                switched_to=None,
-                outcome="no_active",
-                cooldown_minutes=cooldown_minutes,
-            )
-            save_state(paths, state)
-            return RotationResult(
-                previous_active=None,
-                active=None,
-                switched_to=None,
-                marked_bad=False,
-                reason=reason,
-                cooldown_minutes=cooldown_minutes,
-                outcome="no_active",
-            )
 
-        meta = state["accounts"].get(previous)
-        if meta is None:
-            state["active"] = None
-            _mark_switch_runtime(
-                state,
-                status="no_account",
-                reason=reason,
-                trigger=trigger,
-                request_id=request_id,
-                active=None,
-                previous_active=previous,
-                completed_at=utc_now().isoformat(),
-            )
-            _append_switch_history(
-                state,
-                reason=reason,
-                trigger=trigger,
-                request_id=request_id,
-                previous_active=previous,
-                active=None,
-                switched_to=None,
-                outcome="active_missing",
-                cooldown_minutes=cooldown_minutes,
-            )
-            save_state(paths, state)
-            return RotationResult(
-                previous_active=previous,
-                active=None,
-                switched_to=None,
-                marked_bad=False,
-                reason=reason,
-                cooldown_minutes=cooldown_minutes,
-                outcome="active_missing",
-            )
 
-        meta["last_error"] = reason
-        meta["fail_count"] = int(meta.get("fail_count", 0)) + 1
-        if cooldown_minutes > 0:
-            meta["cooldown_until"] = (utc_now() + timedelta(minutes=cooldown_minutes)).isoformat()
-        else:
-            meta["cooldown_until"] = None
-        state["active"] = None
-        state = sync_state_from_disk(paths, state)
+def rotate_after_failure_locked(
+    paths: ManagerPaths,
+    reason: str,
+    cooldown_minutes: int = 60,
+    live_dir: Path | None = None,
+    force_switch: bool = False,
+    dedupe_seconds: int = DEFAULT_SWITCH_DEDUPE_SECONDS,
+    trigger: str = "unknown",
+    request_id: str | None = None,
+) -> RotationResult:
+    if cooldown_minutes < 0:
+        raise ValueError("Cooldown minutes must be non-negative.")
 
-        switched_to = None
-        if force_switch or switch_mode == "auto":
-            switched_to = _best_switch_candidate(paths, state, exclude=previous)
-            if switched_to:
-                _copy_active_runtime(paths, switched_to)
-                state["active"] = switched_to
-                state = sync_state_from_disk(paths, state)
-                _sync_runtime_to_live_dir(paths, state)
+    state = sync_state_from_disk(paths, load_state(paths))
+    if live_dir is not None:
+        state["live_dir"] = str(live_dir.resolve())
+    switch_mode = get_switch_mode(state)
+    runtime = _normalize_switch_runtime(state.get("switch_runtime"))
+    now = utc_now()
+    now_iso = now.isoformat()
 
+    last_completed_at = parse_timestamp(runtime.get("last_completed_at"))
+    if (
+        runtime.get("status") == "ready"
+        and runtime.get("reason") == reason
+        and last_completed_at is not None
+        and (now - last_completed_at).total_seconds() <= dedupe_seconds
+        and state.get("active")
+    ):
         _mark_switch_runtime(
             state,
-            status="ready" if state.get("active") else "no_account",
+            status="ready",
             reason=reason,
             trigger=trigger,
             request_id=request_id,
             active=state.get("active"),
+            previous_active=runtime.get("previous_active"),
+            started_at=runtime.get("last_started_at"),
+            completed_at=runtime.get("last_completed_at"),
+        )
+        _append_switch_history(
+            state,
+            reason=reason,
+            trigger=trigger,
+            request_id=request_id,
+            previous_active=runtime.get("previous_active"),
+            active=state.get("active"),
+            switched_to=None,
+            outcome="already_switched",
+            cooldown_minutes=0,
+            at=runtime.get("last_completed_at"),
+        )
+        save_state(paths, state)
+        return RotationResult(
+            previous_active=runtime.get("previous_active"),
+            active=state.get("active"),
+            switched_to=None,
+            marked_bad=False,
+            reason=reason,
+            cooldown_minutes=0,
+            outcome="already_switched",
+        )
+
+    previous = state.get("active")
+    _mark_switch_runtime(
+        state,
+        status="switching",
+        reason=reason,
+        trigger=trigger,
+        request_id=request_id,
+        active=previous,
+        previous_active=previous,
+        started_at=now_iso,
+        completed_at=None,
+    )
+    save_state(paths, state)
+    if not previous:
+        _mark_switch_runtime(
+            state,
+            status="no_account",
+            reason=reason,
+            trigger=trigger,
+            request_id=request_id,
+            active=None,
+            previous_active=None,
+            completed_at=utc_now().isoformat(),
+        )
+        _append_switch_history(
+            state,
+            reason=reason,
+            trigger=trigger,
+            request_id=request_id,
+            previous_active=None,
+            active=None,
+            switched_to=None,
+            outcome="no_active",
+            cooldown_minutes=cooldown_minutes,
+        )
+        save_state(paths, state)
+        return RotationResult(
+            previous_active=None,
+            active=None,
+            switched_to=None,
+            marked_bad=False,
+            reason=reason,
+            cooldown_minutes=cooldown_minutes,
+            outcome="no_active",
+        )
+
+    meta = state["accounts"].get(previous)
+    if meta is None:
+        state["active"] = None
+        _mark_switch_runtime(
+            state,
+            status="no_account",
+            reason=reason,
+            trigger=trigger,
+            request_id=request_id,
+            active=None,
             previous_active=previous,
             completed_at=utc_now().isoformat(),
         )
@@ -2474,21 +2474,71 @@ def rotate_after_failure(
             trigger=trigger,
             request_id=request_id,
             previous_active=previous,
-            active=state.get("active"),
-            switched_to=switched_to,
-            outcome="switched" if switched_to else "no_candidate",
+            active=None,
+            switched_to=None,
+            outcome="active_missing",
             cooldown_minutes=cooldown_minutes,
         )
         save_state(paths, state)
         return RotationResult(
             previous_active=previous,
-            active=state.get("active"),
-            switched_to=switched_to,
-            marked_bad=True,
+            active=None,
+            switched_to=None,
+            marked_bad=False,
             reason=reason,
             cooldown_minutes=cooldown_minutes,
-            outcome="switched" if switched_to else "no_candidate",
+            outcome="active_missing",
         )
+
+    meta["last_error"] = reason
+    meta["fail_count"] = int(meta.get("fail_count", 0)) + 1
+    if cooldown_minutes > 0:
+        meta["cooldown_until"] = (utc_now() + timedelta(minutes=cooldown_minutes)).isoformat()
+    else:
+        meta["cooldown_until"] = None
+    state["active"] = None
+    state = sync_state_from_disk(paths, state)
+
+    switched_to = None
+    if force_switch or switch_mode == "auto":
+        switched_to = _best_switch_candidate(paths, state, exclude=previous)
+        if switched_to:
+            _copy_active_runtime(paths, switched_to)
+            state["active"] = switched_to
+            state = sync_state_from_disk(paths, state)
+            _sync_runtime_to_live_dir(paths, state)
+
+    _mark_switch_runtime(
+        state,
+        status="ready" if state.get("active") else "no_account",
+        reason=reason,
+        trigger=trigger,
+        request_id=request_id,
+        active=state.get("active"),
+        previous_active=previous,
+        completed_at=utc_now().isoformat(),
+    )
+    _append_switch_history(
+        state,
+        reason=reason,
+        trigger=trigger,
+        request_id=request_id,
+        previous_active=previous,
+        active=state.get("active"),
+        switched_to=switched_to,
+        outcome="switched" if switched_to else "no_candidate",
+        cooldown_minutes=cooldown_minutes,
+    )
+    save_state(paths, state)
+    return RotationResult(
+        previous_active=previous,
+        active=state.get("active"),
+        switched_to=switched_to,
+        marked_bad=True,
+        reason=reason,
+        cooldown_minutes=cooldown_minutes,
+        outcome="switched" if switched_to else "no_candidate",
+    )
 
 
 def login_account(
