@@ -1,5 +1,7 @@
 # agy-cli-manager
 
+[English](README.md) | [中文](README.zh-CN.md)
+
 `agy-cli-manager` is a Python account manager for Antigravity CLI (`agy`) with active-standby failover, quota-aware switching, and machine-readable automation APIs.
 
 It helps you run multiple Antigravity CLI accounts more safely by:
@@ -106,42 +108,92 @@ Environment overrides: `AGY_CREDENTIAL_BACKEND`
 **Restarting `agy` is required after a switch** -- a running process has the
 credential cached in memory.
 
+## Platform support
+
+| Platform | Credential store | Status |
+| --- | --- | --- |
+| Linux (X11/Wayland desktop) | Secret Service via `secret-tool` | Supported, tested |
+| macOS | Keychain via `security` | Implemented, not covered by CI |
+| Linux (headless/container) | none -- token file only | Works if your `agy` build still writes the token file |
+| Windows | none -- token file only | File locking works; Credential Manager is not implemented |
+
+Everything other than the credential store is platform-independent: profile
+storage, switching, cooldowns, log watching, and the JSON APIs behave the same
+everywhere. CI runs on Linux only.
+
+On a platform with no credential-store backend the manager falls back to
+token-file profiles, which is exactly how it behaved before keyring support
+existed. That is fine for older `agy` builds; if your `agy` stores its
+credential in the OS keyring and the manager reports
+`credential_store: none`, saving and switching accounts will not work until a
+backend is available.
+
 ## Install
 
-From a GitHub release wheel:
+One line, with [pipx](https://pipx.pypa.io) (recommended -- isolated, and puts
+`agy-cli-manager` on your PATH):
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-pip install https://github.com/zcop/agy-cli-manager/releases/download/v0.2.1/agy_cli_manager-0.2.1-py3-none-any.whl
+pipx install git+https://github.com/KaylaONeal/agy-cli-manager.git
 ```
 
-To move to a newer release later, replace `v0.2.1` and the wheel filename with the newer version:
+No pipx? A venv works just as well:
 
 ```bash
-pip install --upgrade https://github.com/zcop/agy-cli-manager/releases/download/v0.2.1/agy_cli_manager-0.2.1-py3-none-any.whl
+python3 -m venv ~/.venvs/agy-cli-manager
+~/.venvs/agy-cli-manager/bin/pip install git+https://github.com/KaylaONeal/agy-cli-manager.git
+~/.venvs/agy-cli-manager/bin/agy-cli-manager --help
 ```
 
-From this repo:
+On Linux, also install libsecret if your `agy` keeps its credential in the
+system keyring (see [Credential storage](#credential-storage)):
 
 ```bash
+sudo pacman -S libsecret        # Arch / Omarchy
+sudo apt install secret-tools   # Debian / Ubuntu
+```
+
+Check it worked:
+
+```bash
+agy-cli-manager status
+```
+
+A `credential_store:` line naming a backend means you are ready to go.
+
+To upgrade later:
+
+```bash
+pipx upgrade agy-cli-manager
+```
+
+<details>
+<summary>Other install methods</summary>
+
+From a local clone, in editable mode (for development):
+
+```bash
+git clone https://github.com/KaylaONeal/agy-cli-manager.git
 cd agy-cli-manager
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -e .
 ```
 
-After that, you can use either:
+From an upstream release wheel -- note these do **not** yet contain the keyring
+support in this fork:
 
 ```bash
-agy-cli-manager --help
+pip install https://github.com/zcop/agy-cli-manager/releases/download/v0.2.1/agy_cli_manager-0.2.1-py3-none-any.whl
 ```
 
-or:
+Without installing at all:
 
 ```bash
 PYTHONPATH=src python3 -m agy_cli_manager.cli --help
 ```
+
+</details>
 
 ## Quick Start
 
