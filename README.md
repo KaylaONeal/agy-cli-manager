@@ -36,6 +36,7 @@ Project links:
 - keeps one account active while others stay standby/cooldown/disabled
 - supports isolated interactive `agy` login
 - can import an existing `~/.gemini` or similar live home
+- works with both token-file and OS-keyring `agy` builds (Linux Secret Service, macOS Keychain)
 - supports both manual-only and automatic failover switching modes
 - prefers fuller, healthier standby accounts when auto-switching
 - tracks cached identity, health, and usage metadata
@@ -49,6 +50,53 @@ Project links:
 - Python 3.10+
 - a working `agy` binary available in `PATH`, or passed explicitly with `--agy-binary`
 - a terminal if you want to use `login` or the full-screen dashboard
+- on Linux, `secret-tool` (package `libsecret`) if your `agy` build stores its
+  credential in the OS keyring -- see below
+
+## Credential storage
+
+Older `agy` builds kept the OAuth credential in a file
+(`~/.gemini/antigravity-cli/antigravity-oauth-token`). Newer builds store it in
+the native OS credential store instead:
+
+| Platform | Store | Slot |
+| --- | --- | --- |
+| Linux | Secret Service (D-Bus) | `service=gemini`, `username=antigravity` |
+| macOS | Keychain | `service=gemini`, `account=antigravity` |
+
+The stored value is the same JSON document the token file used to hold, so the
+manager keeps using the token file as its on-disk profile format and bridges at
+two points: it captures the credential out of the keyring when you save an
+account, and publishes it back into the keyring when you switch.
+
+Nothing about the layout changes -- profiles still live under
+`~/.agy-cli-manager/accounts/<name>/`. Before switching away, the manager
+snapshots the live credential back into the outgoing account, because `agy`
+refreshes the token in place while it runs; without that, switching back would
+restore a stale refresh token.
+
+`status` reports the detected backend:
+
+```
+credential_store: secret-service (gemini/antigravity)
+```
+
+If it reports `none` on Linux, install libsecret:
+
+```bash
+sudo pacman -S libsecret        # Arch / Omarchy
+sudo apt install secret-tools   # Debian / Ubuntu
+```
+
+A daemonised `watch` needs a reachable session bus; the manager falls back to
+`/run/user/$UID/bus` when `DBUS_SESSION_BUS_ADDRESS` is unset.
+
+Environment overrides: `AGY_CREDENTIAL_BACKEND`
+(`auto` | `secret-service` | `keychain` | `none`), `AGY_KEYRING_SERVICE`,
+`AGY_KEYRING_USERNAME`.
+
+**Restarting `agy` is required after a switch** -- a running process has the
+credential cached in memory.
 
 ## Install
 
@@ -417,3 +465,84 @@ payload = list_models(paths)
 for model in payload["models"]:
     print(model["name"], model["variant"])
 ```
+
+## Troubleshooting
+
+### `Profile source is missing required auth files`
+
+```text
+error: Profile source is missing required auth files: /home/you/.gemini
+```
+
+Your `agy` build keeps its credential in the OS keyring, not in
+`~/.gemini/antigravity-cli/antigravity-oauth-token`. The manager reads the
+keyring automatically, so this error means it could not reach it.
+
+Check what backend is detected:
+
+```bash
+agy-cli-manager status | grep credential_store
+```
+
+- `credential_store: none` on Linux -- install `libsecret` (see
+  [Credential storage](#credential-storage)), and make sure you are running
+  inside your desktop session so a D-Bus session bus exists.
+- `credential_store: secret-service (...)` but still failing -- the slot is
+  empty. Log in with `agy` first, then confirm:
+
+  ```bash
+  secret-tool lookup service gemini username antigravity | wc -c
+  ```
+
+  A few hundred bytes or more means the credential is there.
+
+Once the backend is detected you no longer need to pass a source directory:
+
+```bash
+agy-cli-manager import-current my-account
+```
+
+### A switch had no effect
+
+`agy` caches the credential in memory, so a running process keeps using the old
+account. Restart `agy` after every switch, then:
+
+```bash
+agy-cli-manager ack-restart
+```
+
+### `watch` sees the quota error but does not rotate
+
+```text
+watch: quota error observed; waiting for agy restart
+```
+
+This is deliberate. After a rotation the watcher arms a restart flag and will
+not rotate again until you acknowledge it with `ack-restart` (or press `Y` in
+the dashboard). It stops one stuck `agy` process from burning through every
+account. Also check that the account you expect it to pick is not still in
+cooldown from an earlier rotation:
+
+```bash
+agy-cli-manager status
+```
+
+### `watch` under systemd cannot reach the keyring
+
+A daemonised watcher often inherits no `DBUS_SESSION_BUS_ADDRESS`. The manager
+falls back to `/run/user/$UID/bus`, which covers the common case; if your setup
+differs, set the variable explicitly in the unit:
+
+```ini
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+```
+
+### Running the test suite
+
+```bash
+python3 -m pytest tests/
+```
+
+Tests never touch the real OS credential store: `tests/conftest.py` forces the
+backend off for every test. Keep that in place when adding tests -- the live
+slot is shared with your actual `agy` install.

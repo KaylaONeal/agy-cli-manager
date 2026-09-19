@@ -23,6 +23,7 @@ if os.name == "nt":
 else:
     import fcntl
 
+from agy_cli_manager import credstore
 from agy_cli_manager.watch import get_log_watch_snapshot
 
 
@@ -458,6 +459,132 @@ def _remove_managed_profile_files(target: Path) -> None:
     target.mkdir(parents=True, exist_ok=True)
     for name in MANAGED_PROFILE_FILES:
         (target / name).unlink(missing_ok=True)
+
+
+# --- OS credential store bridge -------------------------------------------
+#
+# Newer `agy` builds keep the OAuth credential in the OS credential store
+# (Linux Secret Service, macOS Keychain) rather than in the token file.  The
+# stored document is byte-for-byte what the token file used to contain, so the
+# manager keeps the token file as its profile format and bridges at two seams:
+# capture (keyring -> profile) and activate (profile -> keyring).
+
+
+def _profile_token_path(profile_source: Path) -> Path:
+    return profile_source / MANAGED_PROFILE_FILES[0]
+
+
+def _write_profile_token(profile_source: Path, secret: str) -> None:
+    path = _profile_token_path(profile_source)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(secret if secret.endswith("\n") else secret + "\n", encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _credstore_read_active() -> str | None:
+    """Live OS-keyring credential, or None when unavailable/empty."""
+    if not credstore.is_available():
+        return None
+    try:
+        return credstore.read_active()
+    except credstore.CredentialStoreError:
+        return None
+
+
+def _credstore_capture_into_profile(profile_source: Path) -> bool:
+    """Materialize the live keyring credential as `profile_source`'s token file."""
+    secret = _credstore_read_active()
+    if not secret or not _is_plausible_credential(secret):
+        return False
+    try:
+        _write_profile_token(profile_source, secret)
+    except OSError:
+        return False
+    return True
+
+
+def _is_plausible_credential(secret: str) -> bool:
+    """Does this look like an Antigravity credential document?
+
+    The live keyring slot is shared with `agy` itself, so anything published
+    into it must be a credential and not, say, a truncated or placeholder
+    profile file. Publishing garbage there would log the user out.
+    """
+    try:
+        data = json.loads(secret)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    token = data.get("token")
+    if not isinstance(token, dict):
+        return False
+    access_token = token.get("access_token")
+    return isinstance(access_token, str) and bool(access_token.strip())
+
+
+def _credstore_activate_from_profile(profile_source: Path) -> bool:
+    """Publish `profile_source`'s token file as the live keyring credential."""
+    if not credstore.is_available():
+        return False
+    path = _profile_token_path(profile_source)
+    try:
+        secret = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    if not secret or not _is_plausible_credential(secret):
+        return False
+    try:
+        credstore.write_active(secret)
+    except credstore.CredentialStoreError:
+        return False
+    return True
+
+
+def _credstore_snapshot_active_account(paths: ManagerPaths, state: dict) -> bool:
+    """Save the live credential back into the active account's stored profile.
+
+    `agy` refreshes the OAuth token in place while it runs, so the keyring can
+    hold a newer refresh token than the profile on disk.  Without this,
+    switching away and back again restores a stale credential.
+    """
+    active = state.get("active")
+    if not active:
+        return False
+    target = account_dir(paths, active)
+    if not target.is_dir():
+        return False
+    return _credstore_capture_into_profile(_resolve_profile_source(target))
+
+
+@contextmanager
+def _credstore_activated(profile_source: Path):
+    """Temporarily make `profile_source` the live credential, then restore.
+
+    Used when running `agy` against a stored profile that is not the active
+    account: `agy` reads the keyring, not HOME, so without this the subprocess
+    would act as (and refresh) whichever account is currently live.
+    """
+    if not credstore.is_available():
+        yield False
+        return
+    previous = _credstore_read_active()
+    activated = _credstore_activate_from_profile(profile_source)
+    try:
+        yield activated
+    finally:
+        if activated:
+            # Capture whatever agy refreshed back into the profile first.
+            _credstore_capture_into_profile(profile_source)
+            if previous:
+                try:
+                    credstore.write_active(previous)
+                except credstore.CredentialStoreError:
+                    pass
+            else:
+                credstore.clear_active()
 
 
 def _copy_account_profile(source_dir: Path, target_home: Path) -> None:
@@ -1183,7 +1310,8 @@ def list_models(
         _copy_account_profile(runtime_home, restore_home)
         try:
             _copy_account_profile(source_home, runtime_home)
-            models = _run_agy_models_command(runtime_home, agy_binary=agy_binary, timeout_seconds=timeout_seconds)
+            with _credstore_activated(_resolve_profile_source(source_home)):
+                models = _run_agy_models_command(runtime_home, agy_binary=agy_binary, timeout_seconds=timeout_seconds)
         finally:
             _copy_account_profile(restore_home, runtime_home)
     return {
@@ -1218,7 +1346,26 @@ def refresh_account_usage(
     with manager_lock(paths):
         state = sync_state_from_disk(paths, load_state(paths))
         account_name, source_home = _resolve_usage_refresh_target(paths, state, name)
+
+    profile_source = _resolve_profile_source(source_home)
+    is_live_target = name is None
+
+    def _warmup() -> None:
+        # agy reads and refreshes the credential in the OS credential store,
+        # not under HOME, so a warmup for a stored (non-live) account has to
+        # run with that account published to the live slot.
+        if is_live_target:
+            _run_agy_warmup(source_home, agy_binary, warmup_timeout_seconds)
+            _credstore_capture_into_profile(profile_source)
+        else:
+            with _credstore_activated(profile_source):
+                _run_agy_warmup(source_home, agy_binary, warmup_timeout_seconds)
+
     try:
+        if is_live_target:
+            # The live credential may have been refreshed by agy since the
+            # token file was last written.
+            _credstore_capture_into_profile(profile_source)
         needs_warmup = False
         try:
             access_token = _extract_access_token(source_home)
@@ -1228,7 +1375,7 @@ def refresh_account_usage(
             access_token = None
 
         if needs_warmup:
-            _run_agy_warmup(source_home, agy_binary, warmup_timeout_seconds)
+            _warmup()
             access_token = _extract_access_token(source_home)
 
         try:
@@ -1244,7 +1391,7 @@ def refresh_account_usage(
                 },
             )
         except PermissionError:
-            _run_agy_warmup(source_home, agy_binary, warmup_timeout_seconds)
+            _warmup()
             access_token = _extract_access_token(source_home)
             load_response = _cloudcode_request(
                 access_token,
@@ -1447,6 +1594,14 @@ def _identity_from_antigravity_token(token_state: dict) -> dict | None:
     direct_identity = _identity_from_payload(token_state, "antigravity-oauth-token")
     if direct_identity:
         return direct_identity
+    # agy stores the OIDC id_token at the top level, alongside "token".
+    for token_key in ("id_token", "access_token"):
+        token_value = token_state.get(token_key)
+        if isinstance(token_value, str) and token_value.strip() and token_value.count(".") >= 2:
+            payload = _decode_jwt_payload(token_value.strip())
+            identity = _identity_from_payload(payload or {}, f"antigravity-oauth-token.{token_key}")
+            if identity:
+                return identity
     token = token_state.get("token")
     if isinstance(token, dict):
         token_identity = _identity_from_payload(token, "antigravity-oauth-token.token")
@@ -1663,15 +1818,16 @@ def probe_profile_identity_via_usage(
             env["HOME"] = str(runtime_home)
             env["PATH"] = env.get("PATH", "/bin:/usr/bin:/usr/local/bin")
 
-            proc = subprocess.run(
-                [resolved_binary, "-p", "/usage"],
-                cwd=runtime_home,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                check=False,
-            )
+            with _credstore_activated(profile_source):
+                proc = subprocess.run(
+                    [resolved_binary, "-p", "/usage"],
+                    cwd=runtime_home,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout_seconds,
+                    check=False,
+                )
             output = "\n".join(part for part in (proc.stdout, proc.stderr) if part).strip()
             if proc.returncode != 0:
                 tail = "\n".join(output.splitlines()[-8:]) if output else "no output"
@@ -1910,8 +2066,23 @@ def save_account_profile(paths: ManagerPaths, name: str, source_dir: Path, overw
     profile_source = _resolve_profile_source(source_dir)
     if not profile_source.exists() or not profile_source.is_dir():
         raise ValueError(f"Usable profile source not found in {source_dir}")
+    keyring_secret = None
     if not profile_has_login_artifacts(profile_source):
-        raise ValueError(f"Profile source is missing required auth files: {profile_source}")
+        # agy may hold this profile's credential in the OS credential store
+        # instead of the token file; capture it into the saved profile.
+        keyring_secret = _credstore_read_active()
+        if keyring_secret and not _is_plausible_credential(keyring_secret):
+            keyring_secret = None
+        if not keyring_secret:
+            detail = f"Profile source is missing required auth files: {profile_source}"
+            if not credstore.is_available():
+                detail += f" ({credstore.unavailable_hint()})"
+            else:
+                detail += (
+                    f" and no credential is stored in {credstore.describe()}."
+                    " Log in with agy first."
+                )
+            raise ValueError(detail)
 
     target = account_dir(paths, name)
     target_exists = target.exists()
@@ -1922,6 +2093,8 @@ def save_account_profile(paths: ManagerPaths, name: str, source_dir: Path, overw
     else:
         target.mkdir(parents=True, exist_ok=False)
     _copy_account_profile(home_source, target)
+    if keyring_secret:
+        _write_profile_token(_resolve_profile_source(target), keyring_secret)
     identity = _best_effort_saved_profile_identity(target)
 
     with manager_lock(paths):
@@ -1984,6 +2157,9 @@ def _copy_active_runtime(paths: ManagerPaths, name: str) -> None:
 
     paths.runtime_dir.mkdir(parents=True, exist_ok=True)
     _copy_account_profile(src, paths.runtime_dir)
+    # agy reads the OS credential store, not HOME, so activation must publish
+    # this profile's credential into the live keyring slot.
+    _credstore_activate_from_profile(_resolve_profile_source(src))
 
 
 def _sync_runtime_to_live_dir(paths: ManagerPaths, state: dict) -> None:
@@ -2006,6 +2182,8 @@ def switch_account(paths: ManagerPaths, name: str) -> str:
             raise ValueError(f"Account is in cooldown until {cooldown_until.isoformat()}: {name}")
 
         previous = state.get("active")
+        if previous and previous != name:
+            _credstore_snapshot_active_account(paths, state)
         _copy_active_runtime(paths, name)
         state["active"] = name
         state = sync_state_from_disk(paths, state)
@@ -2029,6 +2207,8 @@ def switch_next(paths: ManagerPaths) -> str:
             raise ValueError("No eligible standby account is available.")
         if len(candidates) == 1 and current == target:
             raise ValueError("Only one eligible account is available.")
+        if current and current != target:
+            _credstore_snapshot_active_account(paths, state)
         _copy_active_runtime(paths, target)
         state["active"] = target
         state = sync_state_from_disk(paths, state)
@@ -2070,6 +2250,12 @@ def get_status_snapshot(paths: ManagerPaths) -> dict:
         "runtime_dir": str(paths.runtime_dir),
         "lock_file": str(paths.lock_file),
         "live_dir": state.get("live_dir"),
+        "credential_store": {
+            "backend": credstore.backend_name(),
+            "service": credstore.keyring_service(),
+            "username": credstore.keyring_username(),
+            "available": credstore.is_available(),
+        },
         "active": active_name,
         "active_proxy": _normalize_proxy_config(active_meta.get("proxy")) if isinstance(active_meta, dict) else _default_proxy_config(),
         "switch_mode": get_switch_mode(state),
@@ -2490,6 +2676,7 @@ def rotate_after_failure_locked(
             outcome="active_missing",
         )
 
+    _credstore_snapshot_active_account(paths, state)
     meta["last_error"] = reason
     meta["fail_count"] = int(meta.get("fail_count", 0)) + 1
     if cooldown_minutes > 0:
@@ -2562,6 +2749,18 @@ def login_account(
     runtime_home = live_dir.parent
     runtime_home.mkdir(parents=True, exist_ok=True)
     _remove_managed_profile_files(live_dir)
+    if credstore.is_available():
+        # Preserve the outgoing account's refreshed credential, then empty the
+        # live slot so agy prompts for a fresh login instead of silently
+        # reusing the credential already in the OS credential store.
+        with manager_lock(paths):
+            _credstore_snapshot_active_account(
+                paths, sync_state_from_disk(paths, load_state(paths))
+            )
+        try:
+            credstore.clear_active()
+        except credstore.CredentialStoreError as exc:
+            raise ValueError(f"Could not clear the live credential: {exc}") from exc
 
     env = os.environ.copy()
     env["HOME"] = str(runtime_home)
@@ -2604,6 +2803,8 @@ def login_account(
                 proc.kill()
         raise
 
+    if live_dir.is_dir():
+        _credstore_capture_into_profile(live_dir)
     if not live_dir.is_dir() or not profile_has_login_artifacts(live_dir):
         raise ValueError("agy login did not produce a usable auth profile.")
 
@@ -2641,6 +2842,7 @@ def format_status(paths: ManagerPaths) -> str:
         f"runtime: {paths.runtime_dir}",
         f"lock: {paths.lock_file}",
         f"live_dir: {state.get('live_dir') or '-'}",
+        f"credential_store: {credstore.describe()}",
         f"active: {state.get('active') or '-'}",
         f"active_proxy: {_normalize_proxy_config(state['accounts'].get(state.get('active'), {}).get('proxy') if state.get('active') else None).get('label') or (_normalize_proxy_config(state['accounts'].get(state.get('active'), {}).get('proxy') if state.get('active') else None).get('url') or '-')}",
         f"switch_mode: {get_switch_mode(state)}",
