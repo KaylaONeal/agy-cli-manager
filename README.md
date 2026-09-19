@@ -24,11 +24,19 @@ It is application-agnostic. A Telegram bot can call it, but the manager itself i
 
 ![Sanitized dashboard example](docs/dashboard-screenshot.svg)
 
+This is a fork of [zcop/agy-cli-manager](https://github.com/zcop/agy-cli-manager)
+adding support for `agy` builds that store their credential in the OS keyring
+instead of a token file -- see [Credential storage](#credential-storage).
+
 Project links:
 
-- Repo: `https://github.com/zcop/agy-cli-manager`
-- Release wheel: `https://github.com/zcop/agy-cli-manager/releases`
-- GitHub Pages site: `https://zcop.github.io/agy-cli-manager/`
+- This fork: `https://github.com/KaylaONeal/agy-cli-manager`
+- Upstream repo: `https://github.com/zcop/agy-cli-manager`
+- Release wheel (upstream): `https://github.com/zcop/agy-cli-manager/releases`
+- GitHub Pages site (upstream): `https://zcop.github.io/agy-cli-manager/`
+
+Released wheels come from upstream and do not yet contain the keyring support
+in this fork; install from source to get it.
 
 ## What it does
 
