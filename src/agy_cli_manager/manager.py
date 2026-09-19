@@ -46,6 +46,14 @@ VALID_CANDIDATE_STRATEGIES = ("balanced", "highest-short", "round-robin")
 DEFAULT_SWITCH_DEDUPE_SECONDS = 15
 DEFAULT_SWITCH_HISTORY_LIMIT = 20
 CODE_ASSIST_BASE_URL = "https://cloudcode-pa.googleapis.com"
+# Different `agy` builds talk to different Cloud Code backends, and the same
+# account can report different quota on each. Query all of them and keep the
+# most constrained answer: reporting more headroom than `agy` actually has
+# would keep failover from ever firing.
+DEFAULT_CODE_ASSIST_BASE_URLS = (
+    "https://cloudcode-pa.googleapis.com",
+    "https://daily-cloudcode-pa.googleapis.com",
+)
 CODE_ASSIST_USER_AGENT = "antigravity"
 CODE_ASSIST_LOAD_PATH = "/v1internal:loadCodeAssist"
 CODE_ASSIST_QUOTA_PATH = "/v1internal:retrieveUserQuota"
@@ -88,6 +96,8 @@ class UsageRefreshResult:
     weekly_usage_value: float | None
     weekly_reset_at: str | None
     bucket_count: int
+    quota_groups: list | None = None
+    quota_sources: list | None = None
 
 
 @dataclass
@@ -559,6 +569,57 @@ def _credstore_snapshot_active_account(paths: ManagerPaths, state: dict) -> bool
     return _credstore_capture_into_profile(_resolve_profile_source(target))
 
 
+def _credential_fingerprint(secret: str | None) -> str | None:
+    """Stable id for a credential, without keeping the secret around."""
+    if not secret:
+        return None
+    try:
+        data = json.loads(secret)
+        refresh = data.get("token", {}).get("refresh_token")
+    except (json.JSONDecodeError, ValueError, AttributeError):
+        return None
+    if not isinstance(refresh, str) or not refresh.strip():
+        return None
+    import hashlib
+
+    return hashlib.sha256(refresh.strip().encode("utf-8")).hexdigest()[:16]
+
+
+def detect_credential_drift(paths: ManagerPaths, state: dict) -> dict:
+    """Compare the live keyring credential against the active account.
+
+    `agy login`, a second manager instance, or a manual `secret-tool store`
+    can all leave the OS credential store pointing at a different account than
+    the one the manager believes is active -- and `agy` follows the keyring,
+    not the manager.
+    """
+    result = {"checked": False, "drifted": False, "detail": None}
+    if not credstore.is_available():
+        return result
+    active = state.get("active")
+    if not active:
+        return result
+    profile = _resolve_profile_source(account_dir(paths, active))
+    token_path = _profile_token_path(profile)
+    if not token_path.is_file():
+        return result
+    try:
+        expected = _credential_fingerprint(token_path.read_text(encoding="utf-8"))
+    except OSError:
+        return result
+    live = _credential_fingerprint(_credstore_read_active())
+    result["checked"] = True
+    if expected is None or live is None:
+        return result
+    if expected != live:
+        result["drifted"] = True
+        result["detail"] = (
+            f"the live credential does not match active account '{active}'; "
+            f"run `agy-cli-manager switch {active}` to republish it"
+        )
+    return result
+
+
 @contextmanager
 def _credstore_activated(profile_source: Path):
     """Temporarily make `profile_source` the live credential, then restore.
@@ -779,10 +840,19 @@ def _extract_project_id(load_response: dict, home_root: Path) -> str | None:
     return cached.strip() if isinstance(cached, str) and cached.strip() else None
 
 
-def _cloudcode_request(access_token: str, path: str, payload: dict) -> dict:
+def _code_assist_base_urls() -> tuple[str, ...]:
+    override = os.getenv("AGY_CODE_ASSIST_BASE_URL", "").strip()
+    if override:
+        return tuple(part.strip() for part in override.split(",") if part.strip())
+    return DEFAULT_CODE_ASSIST_BASE_URLS
+
+
+def _cloudcode_request(
+    access_token: str, path: str, payload: dict, base_url: str | None = None
+) -> dict:
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
-        CODE_ASSIST_BASE_URL + path,
+        (base_url or CODE_ASSIST_BASE_URL) + path,
         data=body,
         headers={
             "Authorization": "Bearer " + access_token,
@@ -887,25 +957,73 @@ def _select_quota_summary_group(summary_response: dict) -> dict | None:
     return normalized[0]
 
 
+def _more_constrained(current: dict, candidate: dict) -> dict:
+    """Pick whichever window leaves less headroom."""
+    if candidate.get("status") != "known":
+        return current
+    if current.get("status") != "known":
+        return candidate
+    current_value = _coerce_usage_value(current.get("value"))
+    candidate_value = _coerce_usage_value(candidate.get("value"))
+    if current_value is None:
+        return candidate
+    if candidate_value is None:
+        return current
+    return candidate if candidate_value < current_value else current
+
+
 def _parse_quota_windows_from_summary(summary_response: dict) -> tuple[dict, dict, int]:
-    group = _select_quota_summary_group(summary_response)
-    if not isinstance(group, dict):
-        return _default_usage_window(), _default_usage_window(), 0
-    buckets = group.get("buckets")
-    if not isinstance(buckets, list):
+    """Summarise every quota group, keeping the tightest window of each length.
+
+    A group named "Gemini Models" can sit at 100% while "Claude and GPT models"
+    is exhausted; picking only the Gemini group hides the limit the user is
+    actually hitting.
+    """
+    groups = summary_response.get("groups")
+    if not isinstance(groups, list):
         return _default_usage_window(), _default_usage_window(), 0
 
     short_window = _default_usage_window()
     weekly_window = _default_usage_window()
-    for bucket in buckets:
-        if not isinstance(bucket, dict):
+    bucket_count = 0
+    for group in groups:
+        if not isinstance(group, dict):
             continue
-        window_name = bucket.get("window")
-        if window_name == "5h":
-            short_window = _parse_summary_bucket(bucket)
-        elif window_name == "weekly":
-            weekly_window = _parse_summary_bucket(bucket)
-    return short_window, weekly_window, len(buckets)
+        buckets = group.get("buckets")
+        if not isinstance(buckets, list):
+            continue
+        bucket_count += len(buckets)
+        for bucket in buckets:
+            if not isinstance(bucket, dict):
+                continue
+            parsed = _parse_summary_bucket(bucket)
+            window_name = bucket.get("window")
+            if window_name == "5h":
+                short_window = _more_constrained(short_window, parsed)
+            elif window_name == "weekly":
+                weekly_window = _more_constrained(weekly_window, parsed)
+    return short_window, weekly_window, bucket_count
+
+
+def _summarize_quota_groups(summary_response: dict) -> list[dict]:
+    """Per-group detail, so callers can see which pool is the binding one."""
+    detail: list[dict] = []
+    groups = summary_response.get("groups")
+    if not isinstance(groups, list):
+        return detail
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        entry = {"name": group.get("displayName"), "short": None, "weekly": None}
+        for bucket in group.get("buckets") or []:
+            if not isinstance(bucket, dict):
+                continue
+            if bucket.get("window") == "5h":
+                entry["short"] = _parse_summary_bucket(bucket)
+            elif bucket.get("window") == "weekly":
+                entry["weekly"] = _parse_summary_bucket(bucket)
+        detail.append(entry)
+    return detail
 
 
 def _resolve_usage_refresh_target(paths: ManagerPaths, state: dict, name: str | None) -> tuple[str, Path]:
@@ -1409,8 +1527,38 @@ def refresh_account_usage(
         if not project_id:
             raise ValueError("Cloud Code project id is unavailable.")
 
-        quota_response = _cloudcode_request(access_token, CODE_ASSIST_QUOTA_SUMMARY_PATH, {"project": project_id})
-        short_window, weekly_window, bucket_count = _parse_quota_windows_from_summary(quota_response)
+        # Ask every configured backend and keep the tightest answer.
+        short_window = _default_usage_window()
+        weekly_window = _default_usage_window()
+        bucket_count = 0
+        quota_groups: list = []
+        quota_sources: list = []
+        last_error: Exception | None = None
+        for base_url in _code_assist_base_urls():
+            try:
+                quota_response = _cloudcode_request(
+                    access_token,
+                    CODE_ASSIST_QUOTA_SUMMARY_PATH,
+                    {"project": project_id},
+                    base_url=base_url,
+                )
+            except (PermissionError, ValueError, urllib.error.URLError, OSError) as exc:
+                last_error = exc
+                quota_sources.append({"base_url": base_url, "ok": False, "error": str(exc)[:200]})
+                continue
+            short, weekly, count = _parse_quota_windows_from_summary(quota_response)
+            short_window = _more_constrained(short_window, short)
+            weekly_window = _more_constrained(weekly_window, weekly)
+            bucket_count = max(bucket_count, count)
+            quota_sources.append({"base_url": base_url, "ok": True})
+            for entry in _summarize_quota_groups(quota_response):
+                entry["base_url"] = base_url
+                quota_groups.append(entry)
+
+        if not any(source.get("ok") for source in quota_sources):
+            raise ValueError(
+                f"No Cloud Code backend returned quota data: {last_error}"
+            )
         plan_info = load_response.get("planInfo")
         plan_type = plan_info.get("planType") if isinstance(plan_info, dict) else None
         monthly = plan_info.get("monthlyPromptCredits") if isinstance(plan_info, dict) else None
@@ -1430,6 +1578,8 @@ def refresh_account_usage(
             weekly_usage_value=weekly_window.get("value"),
             weekly_reset_at=weekly_window.get("reset_at"),
             bucket_count=bucket_count,
+            quota_groups=quota_groups,
+            quota_sources=quota_sources,
         )
 
         refreshed_at = utc_now()
@@ -2055,7 +2205,20 @@ def sync_state_from_disk(paths: ManagerPaths, state: dict) -> dict:
     return state
 
 
-def save_account_profile(paths: ManagerPaths, name: str, source_dir: Path, overwrite: bool = False) -> None:
+def save_account_profile(
+    paths: ManagerPaths,
+    name: str,
+    source_dir: Path,
+    overwrite: bool = False,
+    prefer_credstore: bool = False,
+) -> None:
+    """Save `source_dir` as the profile `name`.
+
+    `prefer_credstore` marks the source as the *live* account. On a keyring
+    build the OS credential store is then authoritative: a token file left in
+    the live directory by an earlier switch can be older than the credential
+    `agy` is actually using, or belong to a different account entirely.
+    """
     if not name.strip():
         raise ValueError("Account name cannot be empty.")
     source_dir = source_dir.resolve()
@@ -2067,7 +2230,11 @@ def save_account_profile(paths: ManagerPaths, name: str, source_dir: Path, overw
     if not profile_source.exists() or not profile_source.is_dir():
         raise ValueError(f"Usable profile source not found in {source_dir}")
     keyring_secret = None
-    if not profile_has_login_artifacts(profile_source):
+    if prefer_credstore:
+        keyring_secret = _credstore_read_active()
+        if keyring_secret and not _is_plausible_credential(keyring_secret):
+            keyring_secret = None
+    if keyring_secret is None and not profile_has_login_artifacts(profile_source):
         # agy may hold this profile's credential in the OS credential store
         # instead of the token file; capture it into the saved profile.
         keyring_secret = _credstore_read_active()
@@ -2142,10 +2309,20 @@ def add_account(paths: ManagerPaths, name: str, source_dir: Path) -> None:
 def import_current(paths: ManagerPaths, name: str, source_dir: Path | None = None) -> None:
     with manager_lock(paths):
         state = sync_state_from_disk(paths, load_state(paths))
-        live_dir = source_dir or get_live_dir(state)
+        configured_live_dir = get_live_dir(state)
+        live_dir = source_dir or configured_live_dir
         if live_dir is None:
             raise ValueError("No source_dir provided and no live_dir configured.")
-    add_account(paths, name, live_dir)
+
+    # Importing the live account: trust the credential store over any token
+    # file sitting in the live directory.
+    prefer_credstore = source_dir is None or (
+        configured_live_dir is not None
+        and live_dir.resolve() == configured_live_dir.resolve()
+    )
+    save_account_profile(
+        paths, name, live_dir, overwrite=False, prefer_credstore=prefer_credstore
+    )
 
 
 def _copy_active_runtime(paths: ManagerPaths, name: str) -> None:
@@ -2250,6 +2427,7 @@ def get_status_snapshot(paths: ManagerPaths) -> dict:
         "runtime_dir": str(paths.runtime_dir),
         "lock_file": str(paths.lock_file),
         "live_dir": state.get("live_dir"),
+        "credential_drift": detect_credential_drift(paths, state),
         "credential_store": {
             "backend": credstore.backend_name(),
             "service": credstore.keyring_service(),
@@ -2828,7 +3006,9 @@ def login_account(
         else:
             overwrite = True
 
-    save_account_profile(paths, storage_name, runtime_home, overwrite=overwrite)
+    save_account_profile(
+        paths, storage_name, runtime_home, overwrite=overwrite, prefer_credstore=True
+    )
     return storage_name
 
 
@@ -2843,6 +3023,11 @@ def format_status(paths: ManagerPaths) -> str:
         f"lock: {paths.lock_file}",
         f"live_dir: {state.get('live_dir') or '-'}",
         f"credential_store: {credstore.describe()}",
+        *(
+            [f"credential_drift: WARNING {drift['detail']}"]
+            if (drift := detect_credential_drift(paths, state)).get("drifted")
+            else []
+        ),
         f"active: {state.get('active') or '-'}",
         f"active_proxy: {_normalize_proxy_config(state['accounts'].get(state.get('active'), {}).get('proxy') if state.get('active') else None).get('label') or (_normalize_proxy_config(state['accounts'].get(state.get('active'), {}).get('proxy') if state.get('active') else None).get('url') or '-')}",
         f"switch_mode: {get_switch_mode(state)}",

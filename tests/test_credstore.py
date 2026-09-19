@@ -236,3 +236,119 @@ def test_file_backend_behaviour_is_unchanged(tmp_path, paths, monkeypatch):
     manager.switch_account(paths, "acct-a")
     snapshot = manager.get_status_snapshot(paths)
     assert snapshot["active"] == "acct-a"
+
+
+def test_import_current_prefers_keyring_over_stale_live_token_file(tmp_path, paths, monkeypatch):
+    """A token file left in the live dir must not shadow the real credential.
+
+    `switch` syncs the active profile into live_dir, so that file can name a
+    different account than the one `agy` is actually using.
+    """
+    store = FakeStore(_token_text({"access_token": "real-live"})).install(monkeypatch)
+    live = _make_home(tmp_path, "live", with_token=True)  # stale file: "at-value"
+    manager.set_live_dir(paths, live / ".gemini")
+
+    manager.import_current(paths, "acct", live / ".gemini")
+
+    saved = json.loads(
+        manager._profile_token_path(manager.account_dir(paths, "acct") / ".gemini").read_text()
+    )
+    assert saved["token"]["access_token"] == "real-live"
+    assert store.value is not None
+
+
+def test_add_account_still_trusts_an_explicit_source_dir(tmp_path, paths, monkeypatch):
+    """`add` names an arbitrary saved profile, so its token file wins."""
+    FakeStore(_token_text({"access_token": "live"})).install(monkeypatch)
+    other = _make_home(tmp_path, "other", with_token=True)
+    manager.set_live_dir(paths, (tmp_path / "elsewhere" / ".gemini"))
+
+    manager.add_account(paths, "acct", other / ".gemini")
+
+    saved = json.loads(
+        manager._profile_token_path(manager.account_dir(paths, "acct") / ".gemini").read_text()
+    )
+    assert saved["token"]["access_token"] == "at-value"
+
+
+# --- quota parsing -----------------------------------------------------------
+
+
+def _summary(*groups):
+    return {"groups": [
+        {"displayName": name, "buckets": [
+            {"window": "5h", "remainingFraction": short, "resetTime": "2026-09-19T11:00:00Z"},
+            {"window": "weekly", "remainingFraction": weekly, "resetTime": "2026-09-26T06:00:00Z"},
+        ]} for name, short, weekly in groups
+    ]}
+
+
+def test_quota_uses_the_most_constrained_group():
+    """A full Gemini pool must not mask an exhausted Claude/GPT pool."""
+    short, weekly, count = manager._parse_quota_windows_from_summary(
+        _summary(("Gemini Models", 1.0, 1.0), ("Claude and GPT models", 0.0, 0.30))
+    )
+    assert short["value"] == 0.0
+    assert weekly["value"] == 30.0
+    assert count == 4
+
+
+def test_quota_ignores_unknown_buckets_when_another_group_is_known():
+    short, _, _ = manager._parse_quota_windows_from_summary(
+        _summary(("Weird", None, None), ("Gemini Models", 0.42, 1.0))
+    )
+    assert short["status"] == "known"
+    assert short["value"] == 42.0
+
+
+def test_quota_group_detail_names_each_pool():
+    detail = manager._summarize_quota_groups(
+        _summary(("Gemini Models", 1.0, 1.0), ("Claude and GPT models", 0.0, 0.30))
+    )
+    assert [d["name"] for d in detail] == ["Gemini Models", "Claude and GPT models"]
+    assert detail[1]["short"]["value"] == 0.0
+
+
+def test_base_urls_default_to_both_backends(monkeypatch):
+    monkeypatch.delenv("AGY_CODE_ASSIST_BASE_URL", raising=False)
+    assert manager._code_assist_base_urls() == manager.DEFAULT_CODE_ASSIST_BASE_URLS
+
+
+def test_base_urls_can_be_pinned(monkeypatch):
+    monkeypatch.setenv("AGY_CODE_ASSIST_BASE_URL", "https://only.example.com")
+    assert manager._code_assist_base_urls() == ("https://only.example.com",)
+
+
+# --- drift detection ---------------------------------------------------------
+
+
+def test_drift_is_reported_when_the_keyring_holds_another_account(tmp_path, paths, monkeypatch):
+    store = FakeStore(_token_text({"refresh_token": "rt-a"})).install(monkeypatch)
+    manager.import_current(paths, "acct-a", _make_home(tmp_path, "a", with_token=False) / ".gemini")
+    manager.switch_account(paths, "acct-a")
+
+    # Something else (agy login, another shell) replaces the live credential.
+    store.value = _token_text({"refresh_token": "rt-other"})
+
+    state = manager.sync_state_from_disk(paths, manager.load_state(paths))
+    drift = manager.detect_credential_drift(paths, state)
+    assert drift["checked"] is True
+    assert drift["drifted"] is True
+    assert "acct-a" in drift["detail"]
+
+
+def test_no_drift_when_keyring_matches_active_account(tmp_path, paths, monkeypatch):
+    FakeStore(_token_text({"refresh_token": "rt-a"})).install(monkeypatch)
+    manager.import_current(paths, "acct-a", _make_home(tmp_path, "a", with_token=False) / ".gemini")
+    manager.switch_account(paths, "acct-a")
+
+    state = manager.sync_state_from_disk(paths, manager.load_state(paths))
+    assert manager.detect_credential_drift(paths, state)["drifted"] is False
+
+
+def test_drift_check_is_inert_without_a_backend(tmp_path, paths, monkeypatch):
+    FakeStore(None, available=False).install(monkeypatch)
+    state = manager.sync_state_from_disk(paths, manager.load_state(paths))
+    assert manager.detect_credential_drift(paths, state) == {
+        "checked": False, "drifted": False, "detail": None
+    }

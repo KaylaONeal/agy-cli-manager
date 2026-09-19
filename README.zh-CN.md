@@ -372,6 +372,28 @@ agy-cli-manager status
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 ```
 
+### 配额数字不对，或自动切换从不触发
+
+不同的 `agy` 版本连接的 Cloud Code 后端不一样，**同一个账号在不同后端上的配额可能不同**。管理器会查询 `DEFAULT_CODE_ASSIST_BASE_URLS` 里的每个后端，取**最紧张**的那个值 —— 因为高报剩余量会导致故障转移永远不触发。
+
+配额还分成多个池子，「Gemini Models」可能是 100%，而「Claude and GPT models」已经耗尽。`refresh-usage --json` 会同时给出汇总值和分池明细：
+
+```bash
+agy-cli-manager refresh-usage --json | jq '.quota_groups, .quota_sources'
+```
+
+如果你清楚自己的 `agy` 用哪个后端，可以用 `AGY_CODE_ASSIST_BASE_URL` 固定（多个用逗号分隔）。
+
+另外注意配额可能是**跨账号共享**的（家庭组，或按设备计）。如果两个账号的 `resetTime` 精确到秒都一样，说明它们用的是同一个池子，在它们之间轮换不会有任何帮助。
+
+### status 出现 `credential_drift: WARNING`
+
+说明系统钥匙串里的凭证不是当前激活账号的。`agy` 跟随钥匙串而不是管理器状态，所以此时 `agy` 实际用的账号和 `status` 显示的不是同一个。通常发生在直接跑 `agy` 登录、或有第二个管理器实例之后。重新发布激活账号即可：
+
+```bash
+agy-cli-manager switch <激活账号名>
+```
+
 ### 运行测试
 
 ```bash

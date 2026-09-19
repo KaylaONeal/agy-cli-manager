@@ -597,6 +597,39 @@ differs, set the variable explicitly in the unit:
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 ```
 
+### Quota looks wrong, or failover never fires
+
+`agy` builds do not all talk to the same Cloud Code backend, and the same
+account can report different quota on each. The manager queries every backend
+in `DEFAULT_CODE_ASSIST_BASE_URLS` and keeps the **most constrained** answer,
+because over-reporting headroom would stop failover from ever firing.
+
+Quota is also split into pools -- "Gemini Models" can sit at 100% while
+"Claude and GPT models" is exhausted. `refresh-usage --json` reports the
+tightest value plus per-pool detail:
+
+```bash
+agy-cli-manager refresh-usage --json | jq '.quota_groups, .quota_sources'
+```
+
+Pin a single backend with `AGY_CODE_ASSIST_BASE_URL` (comma-separated for
+several) if you know which one your `agy` uses.
+
+Note that quota may be shared across accounts (family group, or per-device
+limits). If two accounts report identical `resetTime` values down to the
+second, they draw on the same pool and rotating between them will not help.
+
+### `credential_drift: WARNING` in status
+
+The OS credential store holds a credential that is not the active account's.
+`agy` follows the keyring, not the manager, so `agy` is using a different
+account than `status` shows. This happens after a direct `agy` login, or a
+second manager instance. Republish the active account:
+
+```bash
+agy-cli-manager switch <active-account>
+```
+
 ### Running the test suite
 
 ```bash

@@ -2031,6 +2031,8 @@ def main() -> int:
                 "weekly_usage_value": result.weekly_usage_value,
                 "weekly_reset_at": result.weekly_reset_at,
                 "bucket_count": result.bucket_count,
+                "quota_groups": result.quota_groups,
+                "quota_sources": result.quota_sources,
             }
             if args.json:
                 print(json.dumps(payload, indent=2, sort_keys=True))
@@ -2071,6 +2073,8 @@ def main() -> int:
                 "weekly_usage_value": result.weekly_usage_value,
                 "weekly_reset_at": result.weekly_reset_at,
                 "bucket_count": result.bucket_count,
+                "quota_groups": result.quota_groups,
+                "quota_sources": result.quota_sources,
             }
             if args.json:
                 print(json.dumps(payload, indent=2, sort_keys=True))
